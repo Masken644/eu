@@ -1,3 +1,4 @@
+import json
 import os
 import requests
 import streamlit as st
@@ -18,7 +19,7 @@ HEADERS = {"Authorization": f"Bearer {API_KEY}"}
 
 # --- Streamlit Page Setup ---
 st.set_page_config(
-    page_title="CSM Backend Portal - Next Quarter - EU",
+    page_title="CSM Backend Portal - Next Quarter",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -130,6 +131,12 @@ def initialize_session_state():
         'confirm_ranks_pending': False,
         'recommend_upload_version': 0,
         'recommend_notice': None,
+
+        # Batch tabs are built from the server's YAML configs; per-batch
+        # selection, mode and notice keys are created on demand in batch_tab()
+        # as `batch_*_<batch_type>`.
+        'batch_types': None,
+        'batch_types_customer': None,
 
 
         # NEW for Update Ranks
@@ -756,9 +763,194 @@ def offerings_tab():
                 st.error(f"Failed to download product offerings: {e}")
                 logger.error(f"Download failed: {e}")
 
+_BATCH_HISTORY_LABELS = {
+    "in_progress": "🔵 In progress",
+    "completed": "✅ Completed",
+    "failed": "❌ Failed",
+    "completed_with_errors": "⚠️ Completed w/ errors",
+    "timeout": "⏱️ Timed out",
+    "interrupted": "🟡 Interrupted",
+}
+
+
+def _build_batch_history_df(accounts_sorted, history, mode_labels=None):
+    """One row per account: its most recent run of THIS batch."""
+    import pandas as pd
+    rows = []
+    for name in accounts_sorted:
+        rec = history.get(name) if isinstance(history, dict) else None
+        if not rec:
+            row = {"Account": name, "Last Run": "—", "Status": "Never run", "Progress": ""}
+            if mode_labels:
+                row["Mode"] = ""
+            rows.append(row)
+            continue
+
+        status = rec.get("status")
+        scripts_done = rec.get("scripts_succeeded")
+        scripts_tot = rec.get("scripts_total")
+        row = {
+            "Account": name,
+            "Last Run": (rec.get("started_at") if status == "in_progress" else rec.get("finished_at")) or "—",
+            "Status": _BATCH_HISTORY_LABELS.get(status, status or ""),
+            "Progress": f"{scripts_done}/{scripts_tot}" if scripts_tot else "",
+        }
+        if mode_labels:
+            row["Mode"] = mode_labels.get(rec.get("mode"), rec.get("mode") or "")
+        rows.append(row)
+
+    cols = ["Account", "Last Run", "Status", "Progress"] + (["Mode"] if mode_labels else [])
+    return pd.DataFrame(rows, columns=cols)
+
+
+def get_batch_types():
+    """Batch tabs are driven by the server's YAML configs, so nothing about the
+    batches (labels, modes, script lists) is duplicated in the frontend."""
+    customer_id = st.session_state.get("customer_id") or ""
+    if (
+        st.session_state.get("batch_types") is not None
+        and st.session_state.get("batch_types_customer") == customer_id
+    ):
+        return st.session_state["batch_types"]
+
+    resp = make_api_request("get", "batch_types", params={"customer_id": customer_id})
+    types = (resp or {}).get("batch_types")
+    if types is None:
+        return None
+    st.session_state["batch_types"] = types
+    st.session_state["batch_types_customer"] = customer_id
+    return types
+
+
+def batch_tab(batch: dict):
+    """Multi-select accounts and run one YAML-defined batch across them."""
+    key = batch.get("key") or "batch"
+
+    if batch.get("error"):
+        st.error(f"Batch configuration problem: {batch['error']}")
+        return
+
+    if not st.session_state.setup_complete:
+        st.info("Complete Initial Setup to enable this section.")
+        return
+
+    notice_key = f"batch_notice_{key}"
+    if st.session_state.get(notice_key):
+        st.success(st.session_state[notice_key])
+        st.session_state[notice_key] = None
+
+    customer_id = st.session_state["customer_id"]
+    accounts_sorted = sorted(st.session_state.get("account_names", []) or [])
+    modes = batch.get("modes") or []
+    mode_labels = {m["key"]: m.get("label") or m["key"] for m in modes}
+
+    resp = make_api_request(
+        "get", "batch_account_history",
+        params={"customer_id": customer_id, "batch_type": key},
+    )
+    if resp is None:
+        return
+    history = resp.get("history") or {}
+    # {accountname: batch_type} — an account held by ANY batch, since the server
+    # locks accounts across batches.
+    busy = resp.get("busy") or {}
+
+    all_types = st.session_state.get("batch_types") or []
+    type_labels = {b.get("key"): (b.get("label") or b.get("key")) for b in all_types}
+
+    st.subheader("Account run history")
+    st.caption(
+        "Most recent run of this batch per account for this customer. "
+        "\"Never run\" means this batch has not been run for that account. "
+        "Click Refresh to fetch the latest progress."
+    )
+
+    if st.button("Refresh", key=f"batch_refresh_{key}"):
+        # Also drop the cached batch definitions, so a YAML edit on the server
+        # (a changed label or mode) shows up without restarting the app.
+        st.session_state["batch_types"] = None
+        st.rerun()
+
+    st.dataframe(
+        _build_batch_history_df(accounts_sorted, history, mode_labels if modes else None),
+        width="stretch",
+        hide_index=True,
+    )
+
+    st.subheader("Select accounts to run")
+    if busy:
+        st.info(
+            "Currently running and excluded from selection: "
+            + ", ".join(
+                f"{name} (in {type_labels.get(bt, bt)})"
+                for name, bt in sorted(busy.items())
+            )
+        )
+
+    selectable_accounts = [a for a in accounts_sorted if a not in busy]
+    sel_key = f"batch_selected_{key}"
+    # A launch asks for the selection to be cleared on the NEXT run: this key
+    # belongs to the multiselect, and Streamlit forbids writing a widget's key
+    # once the widget has been instantiated.
+    if st.session_state.pop(f"batch_clear_{key}", False):
+        st.session_state[sel_key] = []
+    if sel_key in st.session_state:
+        st.session_state[sel_key] = [
+            a for a in st.session_state[sel_key] if a in selectable_accounts
+        ]
+    selected = st.multiselect(
+        "Accounts",
+        options=selectable_accounts,
+        key=sel_key,
+        help=(
+            "Pick one or more accounts; each runs in its own thread "
+            f"(max {batch.get('max_workers', 4)} in parallel)."
+        ),
+    )
+
+    chosen_mode = None
+    if modes:
+        st.subheader("Run mode")
+        default_idx = next((i for i, m in enumerate(modes) if m.get("default")), 0)
+        chosen_label = st.radio(
+            "Mode",
+            [mode_labels[m["key"]] for m in modes],
+            index=default_idx,
+            horizontal=True,
+            key=f"batch_mode_{key}",
+        )
+        chosen_mode = next(m["key"] for m in modes if mode_labels[m["key"]] == chosen_label)
+
+    if st.button("Run batch", disabled=not selected, type="primary", key=f"batch_run_{key}"):
+        payload = {
+            "customer_id": customer_id,
+            "batch_type": key,
+            "accounts": json.dumps(selected),
+        }
+        if chosen_mode:
+            payload["mode"] = chosen_mode
+
+        with st.spinner("Launching batch..."):
+            resp = make_api_request("post", "start_batch", data=payload)
+
+        if resp and resp.get("success"):
+            note = f"Batch {resp['batch_id']} launched for {resp['accounts_resolved']} account(s)"
+            if resp.get("mode"):
+                note += f" in {mode_labels.get(resp['mode'], resp['mode'])} mode"
+            note += f" ({resp.get('scripts')} script(s) each)."
+            unres = resp.get("accounts_unresolved") or []
+            if unres:
+                note += f" Skipped (not in d_input_account): {', '.join(unres)}"
+            st.session_state[notice_key] = note
+            st.session_state[f"batch_clear_{key}"] = True
+            st.rerun()
+        else:
+            st.error("Failed to launch batch. Check server logs.")
+
+
 # --- Main ---
 def main():
-    st.title("CSM Backend Portal - Next Quarter - EU")
+    st.title("CSM Backend Portal - Next Quarter")
 
     if st.session_state.setup_complete:
         with st.sidebar:
@@ -767,14 +959,31 @@ def main():
             st.markdown(f"**ID:** {st.session_state['customer_id']}")
             st.markdown(f"**Accounts:** {len(st.session_state.get('account_names', []))}")
 
-    t1, t2, t3, t4 = st.tabs(
-        ["Initial Setup", "Manage Contacts", "Update Ranks", "Update Recommendations"]
-    )
+    base_labels = ["Initial Setup", "Manage Contacts", "Update Ranks", "Update Recommendations"]
+    base_tabs = [initial_setup_tab, contacts_tab, ranks_tab, update_recommendation_tab]
 
-    with t1: initial_setup_tab()
-    with t2: contacts_tab()
-    with t3: ranks_tab()
-    with t4: update_recommendation_tab()
+    batch_types = get_batch_types()
+    batches = batch_types or []
+    labels = base_labels + [b.get("label") or b.get("key") for b in batches]
+    if batch_types is None:
+        labels.append("Batches")
+
+    tabs = st.tabs(labels)
+
+    for tab, render in zip(tabs, base_tabs):
+        with tab:
+            render()
+
+    for tab, batch in zip(tabs[len(base_tabs):], batches):
+        with tab:
+            batch_tab(batch)
+
+    if batch_types is None:
+        with tabs[-1]:
+            st.error(
+                "Could not load the batch definitions from the server. "
+                "Check that the backend is reachable and that the batch YAML files exist."
+            )
 
 
 if __name__ == "__main__":
